@@ -111,7 +111,6 @@
 #define CGCTL_REG		(QSCRATCH_REG_OFFSET + 0x28)
 #define PWR_EVNT_IRQ_STAT_REG    (QSCRATCH_REG_OFFSET + 0x58)
 #define PWR_EVNT_IRQ_MASK_REG    (QSCRATCH_REG_OFFSET + 0x5C)
-#define EXTRA_INP_REG		(QSCRATCH_REG_OFFSET + 0x1e4)
 
 #define PWR_EVNT_POWERDOWN_IN_P3_MASK		BIT(2)
 #define PWR_EVNT_POWERDOWN_OUT_P3_MASK		BIT(3)
@@ -119,8 +118,6 @@
 #define PWR_EVNT_LPM_OUT_L2_MASK		BIT(5)
 #define PWR_EVNT_LPM_OUT_RX_ELECIDLE_IRQ_MASK	BIT(12)
 #define PWR_EVNT_LPM_OUT_L1_MASK		BIT(13)
-
-#define EXTRA_INP_SS_DISABLE	BIT(5)
 
 /* QSCRATCH_GENERAL_CFG register bit offset */
 #define PIPE_UTMI_CLK_SEL	BIT(0)
@@ -585,7 +582,6 @@ struct dwc3_msm {
 	enum dwc3_id_state	id_state;
 	bool			use_pwr_event_for_wakeup;
 	bool			host_poweroff_in_pm_suspend;
-	bool			disable_host_ssphy_powerdown;
 	bool			enable_host_slow_suspend;
 	unsigned long		lpm_flags;
 	unsigned int		vbus_draw;
@@ -3172,32 +3168,6 @@ static void dwc3_gsi_event_buf_alloc(struct dwc3 *dwc)
 	}
 }
 
-static void dwc3_msm_switch_utmi(struct dwc3_msm *mdwc, int enable)
-{
-	u32 reg;
-
-	dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG,
-		dwc3_msm_read_reg(mdwc->base,
-		QSCRATCH_GENERAL_CFG)
-		| PIPE_UTMI_CLK_DIS);
-
-	udelay(5);
-
-	reg = dwc3_msm_read_reg(mdwc->base, QSCRATCH_GENERAL_CFG);
-	if (enable)
-		reg |= (PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
-	else
-		reg &= ~(PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
-	dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG, reg);
-
-	udelay(5);
-
-	dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG,
-		dwc3_msm_read_reg(mdwc->base,
-		QSCRATCH_GENERAL_CFG)
-		& ~PIPE_UTMI_CLK_DIS);
-}
-
 static void dwc3_msm_set_clk_sel(struct dwc3_msm *mdwc)
 {
 	/*
@@ -3205,8 +3175,27 @@ static void dwc3_msm_set_clk_sel(struct dwc3_msm *mdwc)
 	 * having ssphy and only USB high/full speed is supported.
 	 */
 	if (dwc3_msm_get_max_speed(mdwc) == USB_SPEED_HIGH ||
-				dwc3_msm_get_max_speed(mdwc) == USB_SPEED_FULL)
-		dwc3_msm_switch_utmi(mdwc, 1);
+				dwc3_msm_get_max_speed(mdwc) == USB_SPEED_FULL) {
+		dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG,
+			dwc3_msm_read_reg(mdwc->base,
+			QSCRATCH_GENERAL_CFG)
+			| PIPE_UTMI_CLK_DIS);
+
+		usleep_range(2, 5);
+
+		dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG,
+			dwc3_msm_read_reg(mdwc->base,
+			QSCRATCH_GENERAL_CFG)
+			| PIPE_UTMI_CLK_SEL
+			| PIPE3_PHYSTATUS_SW);
+
+		usleep_range(2, 5);
+
+		dwc3_msm_write_reg(mdwc->base, QSCRATCH_GENERAL_CFG,
+			dwc3_msm_read_reg(mdwc->base,
+			QSCRATCH_GENERAL_CFG)
+			& ~PIPE_UTMI_CLK_DIS);
+	}
 }
 
 static void *gadget_get_drvdata(struct usb_gadget *g)
@@ -4207,7 +4196,7 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc, bool force_power_collapse)
 	msm_dwc3_perf_vote_enable(mdwc, false);
 
 	/* disable power event irq, hs and ss phy irq is used as wake up src */
-	disable_irq(mdwc->wakeup_irq[PWR_EVNT_IRQ].irq);
+	disable_irq_nosync(mdwc->wakeup_irq[PWR_EVNT_IRQ].irq);
 
 	dwc3_set_phy_speed_flags(mdwc);
 	/* Suspend HS PHY */
@@ -4387,9 +4376,7 @@ static int dwc3_msm_resume(struct dwc3_msm *mdwc)
 	if (dwc3_msm_get_max_speed(mdwc) >= USB_SPEED_SUPER &&
 			mdwc->lpm_flags & MDWC3_SS_PHY_SUSPEND) {
 		dwc3_set_ssphy_orientation_flag(mdwc);
-
-		if (!(mdwc->ss_phy->flags & PHY_SS_PHY_DYNAMIC_POWERDOWN))
-			usb_phy_set_suspend(mdwc->ss_phy, 0);
+		usb_phy_set_suspend(mdwc->ss_phy, 0);
 
 		mdwc->ss_phy->flags &= ~DEVICE_IN_SS_MODE;
 		mdwc->lpm_flags &= ~MDWC3_SS_PHY_SUSPEND;
@@ -6119,8 +6106,6 @@ static int dwc3_msm_parse_params(struct dwc3_msm *mdwc, struct device_node *node
 				"qcom,use-pdc-interrupts");
 
 	mdwc->use_eusb2_phy = of_property_read_bool(node, "qcom,use-eusb2-phy");
-	mdwc->disable_host_ssphy_powerdown = of_property_read_bool(node,
-				"qcom,disable-host-ssphy-powerdown");
 
 	mdwc->dis_sending_cm_l1_quirk = of_property_read_bool(node,
 				"qcom,dis-sending-cm-l1-quirk");
@@ -6651,56 +6636,6 @@ static void dwc3_msm_shutdown(struct platform_device *pdev)
 	flush_workqueue(mdwc->sm_usb_wq);
 }
 
-static int dwc3_msm_host_ss_powerdown(struct dwc3_msm *mdwc)
-{
-	u32 reg;
-
-	/*
-	 * Conditions for allowing dynamic powerdown of the SS PHY:
-	 *   1. The feature is not disabled by the DT property
-	 *   2. Not currently in a DP active state
-	 *   3. Connected device's speed is not super-speed
-	 */
-	if (mdwc->disable_host_ssphy_powerdown || mdwc->dp_state ||
-		dwc3_msm_get_max_speed(mdwc) < USB_SPEED_SUPER)
-		return 0;
-
-	reg = dwc3_msm_read_reg(mdwc->base, EXTRA_INP_REG);
-	reg |= EXTRA_INP_SS_DISABLE;
-	dwc3_msm_write_reg(mdwc->base, EXTRA_INP_REG, reg);
-	dwc3_msm_switch_utmi(mdwc, 1);
-
-	usb_phy_notify_disconnect(mdwc->ss_phy,
-					USB_SPEED_SUPER);
-	usb_phy_set_suspend(mdwc->ss_phy, 1);
-	mdwc->ss_phy->flags |= PHY_SS_PHY_DYNAMIC_POWERDOWN;
-
-	return 0;
-}
-
-static int dwc3_msm_host_ss_powerup(struct dwc3_msm *mdwc)
-{
-	u32 reg;
-
-	dbg_log_string("start: speed:%d\n", dwc3_msm_get_max_speed(mdwc));
-	if (!mdwc->in_host_mode ||
-		mdwc->disable_host_ssphy_powerdown ||
-		dwc3_msm_get_max_speed(mdwc) < USB_SPEED_SUPER)
-		return 0;
-
-	usb_phy_set_suspend(mdwc->ss_phy, 0);
-	usb_phy_notify_connect(mdwc->ss_phy,
-					USB_SPEED_SUPER);
-
-	dwc3_msm_switch_utmi(mdwc, 0);
-	reg = dwc3_msm_read_reg(mdwc->base, EXTRA_INP_REG);
-	reg &= ~EXTRA_INP_SS_DISABLE;
-	dwc3_msm_write_reg(mdwc->base, EXTRA_INP_REG, reg);
-	mdwc->ss_phy->flags &= ~PHY_SS_PHY_DYNAMIC_POWERDOWN;
-
-	return 0;
-}
-
 static int usb_audio_pre_reset(struct usb_interface *intf)
 {
 	return 0;
@@ -6814,7 +6749,6 @@ static int dwc3_msm_host_notifier(struct notifier_block *nb,
 					mdwc->core_clk_rate_hs);
 				mdwc->max_rh_port_speed = USB_SPEED_HIGH;
 				dwc3_msm_update_bus_bw(mdwc, BUS_VOTE_SVS);
-				dwc3_msm_host_ss_powerdown(mdwc);
 
 				if (mdwc->wcd_usbss)
 					wcd_usbss_dpdm_switch_update(true,
@@ -6829,7 +6763,6 @@ static int dwc3_msm_host_notifier(struct notifier_block *nb,
 				mdwc->core_clk_rate);
 			mdwc->max_rh_port_speed = USB_SPEED_UNKNOWN;
 			dwc3_msm_update_bus_bw(mdwc, mdwc->default_bus_vote);
-			dwc3_msm_host_ss_powerup(mdwc);
 
 			if (udev->parent->speed >= USB_SPEED_SUPER)
 				usb_redriver_host_powercycle(mdwc->redriver);
@@ -7074,12 +7007,8 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 		 * reset before dwc3_gadget_init() is called.  Otherwise, USB
 		 * gadget will be set to HS only.
 		 */
-		mdwc->in_host_mode = false;
-
-		if (!mdwc->ss_release_called) {
-			dwc3_msm_host_ss_powerup(mdwc);
+		if (!mdwc->ss_release_called)
 			dwc3_msm_clear_dp_only_params(mdwc);
-		}
 
 		/*
 		 * Need to explicitly clear here, as changes were made to avoid
@@ -7116,6 +7045,7 @@ static int dwc3_otg_start_host(struct dwc3_msm *mdwc, int on)
 
 		dwc3_msm_write_reg_field(mdwc->base, DWC3_GUSB3PIPECTL(0),
 				DWC3_GUSB3PIPECTL_SUSPHY, 0);
+		mdwc->in_host_mode = false;
 
 		/* wait for LPM, to ensure h/w is reset after stop_host */
 		set_bit(WAIT_FOR_LPM, &mdwc->inputs);
